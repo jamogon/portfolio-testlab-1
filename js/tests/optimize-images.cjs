@@ -1,27 +1,215 @@
-#!/usr/bin/env node
-/**
- * optimize-images.cjs — Genera versiones WebP optimizadas de las imágenes de proyecto.
- *
- * Uso:  node js/tests/optimize-images.cjs
- *
- * Entrada:  assets/project-01.jpg … assets/project-04.jpg
- * Salida:   assets/project-XX-400w.webp  (400×250)
- *           assets/project-XX-800w.webp  (800×500)
- *
- * Zero-dependency (Node ≥ 18). Decodifica JPEG baseline, redimensiona con
- * area-average y codifica WebP lossless (VP8L).
- */
+/* ============================================================
+   Optimización de imágenes — Portfolio
+   Convierte las imágenes de proyecto (JPG) a WebP y genera
+   variantes responsive (400w / 800w). Los JPG originales se
+   conservan en assets/ como fallback para navegadores sin WebP.
 
-'use strict';
+   Uso:
+     node js/tests/optimize-images.cjs
 
-const fs = require('fs');
-const path = require('path');
+   Requisitos: Node.js >= 18. Sin dependencias externas:
+   - Decodificador JPEG propio (baseline DCT Huffman, 8 bits,
+     muestreos 4:4:4 / 4:2:2 / 4:2:0 / 4:1:1, sin progresivo).
+   - Reescalado por muestreo de área (promedio de caja).
+   - Codificador WebP lossless (VP8L) propio: LZ77 con hash
+     chains + backward references y codificación Huffman
+     canónica (sin meta-Huffman ni color cache).
+   ============================================================ */
 
-/* ------------------------------------------------------------------ */
-/*  JPEG decoder (baseline DCT, Huffman)                               */
-/* ------------------------------------------------------------------ */
+"use strict";
 
-const ZIGZAG = [
+const fs = require("fs");
+const path = require("path");
+
+const ROOT = path.join(__dirname, "..", "..");
+
+/* ============================================================
+   1. DECODIFICADOR JPEG (baseline) → { width, height, data:RGBA }
+   ============================================================ */
+
+function decodeJPEG(buf) {
+  if (buf[0] !== 0xff || buf[1] !== 0xd8) throw new Error("No es JPEG (SOI ausente)");
+
+  // Tablas de Huffman: { dc: [...], ac: [...] } por id
+  const huff = { dc: {}, ac: {} };
+  const qtables = {};
+  let frame = null;
+  let pos = 2;
+
+  const buildDec = (counts, symbols) => {
+    // Genera tabla canónica: mapa (longitud,código) → símbolo
+    const table = new Map();
+    let code = 0;
+    let k = 0;
+    for (let len = 1; len <= 16; len++) {
+      for (let i = 0; i < counts[len - 1]; i++) {
+        table.set((len << 24) | code, symbols[k++]);
+        code++;
+      }
+      code <<= 1;
+    }
+    return { table, maxLen: 16 };
+  };
+
+  while (pos < buf.length) {
+    if (buf[pos] !== 0xff) { pos++; continue; }
+    let marker = buf[pos + 1];
+    // Rellenos 0xFF
+    while (marker === 0xff) { pos++; marker = buf[pos + 1]; }
+    if (marker === 0xd8 || marker === 0x01 || (marker >= 0xd0 && marker <= 0xd7)) {
+      pos += 2;
+      continue;
+    }
+    const len = buf.readUInt16BE(pos + 2);
+    const seg = pos + 4;
+
+    if (marker === 0xdb) {
+      // DQT
+      let p = seg;
+      while (p < seg + len - 2) {
+        const pq = buf[p] >> 4;
+        const id = buf[p] & 0x0f;
+        p++;
+        const t = new Uint16Array(64);
+        for (let i = 0; i < 64; i++) {
+          t[i] = pq === 0 ? buf[p + i] : buf.readUInt16BE(p + i * 2);
+        }
+        p += pq === 0 ? 64 : 128;
+        qtables[id] = t;
+      }
+    } else if (marker === 0xc4) {
+      // DHT
+      let p = seg;
+      const end = seg + len - 2;
+      while (p < end) {
+        const tc = buf[p] >> 4;
+        const th = buf[p] & 0x0f;
+        p++;
+        const counts = Array.from(buf.subarray(p, p + 16));
+        p += 16;
+        const total = counts.reduce((a, b) => a + b, 0);
+        const symbols = Array.from(buf.subarray(p, p + total));
+        p += total;
+        huff[tc === 0 ? "dc" : "ac"][th] = buildDec(counts, symbols);
+      }
+    } else if (marker === 0xc0 || marker === 0xc1 || marker === 0xc2) {
+      if (marker === 0xc2) throw new Error("JPEG progresivo no soportado");
+      const height = buf.readUInt16BE(seg + 1);
+      const width = buf.readUInt16BE(seg + 3);
+      const ncomp = buf[seg + 5];
+      const comps = [];
+      for (let i = 0; i < ncomp; i++) {
+        comps.push({
+          id: buf[seg + 6 + i * 3],
+          h: buf[seg + 6 + i * 3 + 1] >> 4,
+          v: buf[seg + 6 + i * 3 + 1] & 0x0f,
+          tq: buf[seg + 6 + i * 3 + 2],
+        });
+      }
+      frame = { width, height, comps };
+    } else if (marker === 0xda) {
+      // SOS: cabecera de scan + datos entrelazados hasta el siguiente marker
+      const ns = buf[seg];
+      const scomps = [];
+      for (let i = 0; i < ns; i++) {
+        scomps.push({
+          id: buf[seg + 1 + i * 2],
+          td: buf[seg + 2 + i * 2] >> 4,
+          ta: buf[seg + 2 + i * 2] & 0x0f,
+        });
+      }
+      const dataStart = seg + len - 2;
+      // El scan termina en el próximo marker no-RST (0xFF 0xD9 EOI, u otro)
+      let dataEnd = dataStart;
+      while (dataEnd < buf.length - 1) {
+        if (buf[dataEnd] === 0xff && buf[dataEnd + 1] !== 0x00 &&
+            !(buf[dataEnd + 1] >= 0xd0 && buf[dataEnd + 1] <= 0xd7)) {
+          break;
+        }
+        dataEnd++;
+      }
+      const scan = buf.subarray(dataStart, dataEnd);
+      const pixels = decodeScan(scan, frame, scomps, huff, qtables);
+      return pixels;
+    }
+    pos += 2 + len;
+  }
+  throw new Error("No se encontró scan SOS");
+}
+
+// Lector de bits con destuffing de 0xFF00 y reinicio en RST
+function bitReader(buf) {
+  let bytePos = 0;
+  let bitPos = 0;
+  return {
+    getBit() {
+      if (bytePos >= buf.length) return 0; // padding
+      let b = buf[bytePos];
+      const bit = (b >> (7 - bitPos)) & 1;
+      bitPos++;
+      if (bitPos === 8) {
+        bitPos = 0;
+        bytePos++;
+        if (bytePos < buf.length && buf[bytePos - 1] === 0xff) {
+          if (buf[bytePos] === 0x00) bytePos++; // destuff
+        }
+      }
+      return bit;
+    },
+    getBits(n) {
+      let v = 0;
+      for (let i = 0; i < n; i++) v = (v << 1) | this.getBit();
+      return v;
+    },
+    align() {
+      if (bitPos !== 0) { bitPos = 0; bytePos++; }
+      // Saltar markers RST en el flujo
+      while (bytePos + 1 < buf.length && buf[bytePos] === 0xff &&
+             buf[bytePos + 1] >= 0xd0 && buf[bytePos + 1] <= 0xd7) {
+        bytePos += 2;
+      }
+    },
+  };
+}
+
+function huffDecode(reader, dec) {
+  let code = 0;
+  for (let len = 1; len <= dec.maxLen; len++) {
+    code = (code << 1) | reader.getBit();
+    const sym = dec.table.get((len << 24) | code);
+    if (sym !== undefined) return sym;
+  }
+  throw new Error("Código Huffman inválido");
+}
+
+function extend(v, t) {
+  // JPEG "extend": valores con t bits; si el bit alto es 0, es negativo
+  return v < (1 << (t - 1)) ? v - (1 << t) + 1 : v;
+}
+
+// IDCT 8x8 (flotante, directa) sobre coeficientes descuantizados
+function idct8x8(coeff) {
+  const out = new Float64Array(64);
+  const C = [];
+  for (let u = 0; u < 8; u++) C[u] = u === 0 ? Math.SQRT1_2 : 1;
+  for (let y = 0; y < 8; y++) {
+    for (let x = 0; x < 8; x++) {
+      let s = 0;
+      for (let v = 0; v < 8; v++) {
+        for (let u = 0; u < 8; u++) {
+          s += C[u] * C[v] * coeff[v * 8 + u] *
+               Math.cos(((2 * x + 1) * u * Math.PI) / 16) *
+               Math.cos(((2 * y + 1) * v * Math.PI) / 16);
+        }
+      }
+      out[y * 8 + x] = s / 4;
+    }
+  }
+  return out;
+}
+
+// Orden zigzag
+const ZZ = [
   0, 1, 8, 16, 9, 2, 3, 10,
   17, 24, 32, 25, 18, 11, 4, 5,
   12, 19, 26, 33, 40, 48, 41, 34,
@@ -32,444 +220,218 @@ const ZIGZAG = [
   53, 60, 61, 54, 47, 55, 62, 63,
 ];
 
-function buildHuffmanTable(counts, symbols) {
-  const table = new Map();
-  let code = 0;
-  let k = 0;
-  for (let len = 1; len <= 16; len++) {
-    for (let i = 0; i < counts[len - 1]; i++) {
-      table.set((code << 16) | len, symbols[k++]);
-      code++;
-    }
-    code <<= 1;
-  }
-  return table;
-}
+function decodeScan(scan, frame, scomps, huff, qtables) {
+  const { width, height, comps } = frame;
+  const maxH = Math.max(...comps.map((c) => c.h));
+  const maxV = Math.max(...comps.map((c) => c.v));
+  const mcusX = Math.ceil(width / (8 * maxH));
+  const mcusY = Math.ceil(height / (8 * maxV));
 
-function bitReader(data) {
-  let pos = 0;
-  let bitBuf = 0;
-  let bitCnt = 0;
-
-  function readBit() {
-    if (bitCnt === 0) {
-      if (pos >= data.length) throw new Error('JPEG: unexpected end of data');
-      let byte = data[pos++];
-      if (byte === 0xff) {
-        const next = data[pos++];
-        if (next === 0x00) {
-          /* stuffed byte — ok */
-        } else if (next >= 0xd0 && next <= 0xd7) {
-          /* restart marker — skip */
-        } else {
-          throw new Error(`JPEG: unexpected marker 0xFF${next.toString(16)} in scan data`);
-        }
-      }
-      bitBuf = byte;
-      bitCnt = 8;
-    }
-    const bit = (bitBuf >> 7) & 1;
-    bitBuf = (bitBuf << 1) & 0xff;
-    bitCnt--;
-    return bit;
-  }
-
-  function readBits(n) {
-    let v = 0;
-    for (let i = 0; i < n; i++) v = (v << 1) | readBit();
-    return v;
-  }
-
-  function decodeHuffman(table) {
-    let code = 0;
-    for (let len = 1; len <= 16; len++) {
-      code = (code << 1) | readBit();
-      const sym = table.get((code << 16) | len);
-      if (sym !== undefined) return sym;
-    }
-    throw new Error('JPEG: invalid Huffman code');
-  }
-
-  return { readBit, readBits, decodeHuffman, get pos() { return pos; } };
-}
-
-function idct8x8(block) {
-  const out = new Float32Array(64);
-  const tmp = new Float32Array(64);
-  const C = [];
-  for (let i = 0; i < 8; i++) C[i] = i === 0 ? 1 / Math.SQRT2 : 1;
-  const cos = [];
-  for (let u = 0; u < 8; u++) {
-    cos[u] = [];
-    for (let x = 0; x < 8; x++) cos[u][x] = Math.cos(((2 * x + 1) * u * Math.PI) / 16);
-  }
-  for (let y = 0; y < 8; y++) {
-    for (let x = 0; x < 8; x++) {
-      let sum = 0;
-      for (let v = 0; v < 8; v++) {
-        for (let u = 0; u < 8; u++) {
-          sum += C[u] * C[v] * block[v * 8 + u] * cos[u][x] * cos[v][y];
-        }
-      }
-      tmp[y * 8 + x] = sum / 4;
-    }
-  }
-  for (let i = 0; i < 64; i++) out[i] = tmp[i] + 128;
-  return out;
-}
-
-function decodeJpeg(buffer) {
-  let pos = 0;
-  function readMarker() {
-    while (pos < buffer.length && buffer[pos] !== 0xff) pos++;
-    while (pos < buffer.length && buffer[pos] === 0xff) pos++;
-    return buffer[pos++];
-  }
-  function readSegment() {
-    const len = buffer.readUInt16BE(pos);
-    const data = buffer.slice(pos + 2, pos + len);
-    pos += len;
-    return data;
-  }
-
-  const quantTables = [];
-  const huffmanDC = [];
-  const huffmanAC = [];
-  let width = 0;
-  let height = 0;
-  let components = [];
-  let maxH = 1;
-  let maxV = 1;
-  let precision = 8;
-
-  /* ---- parse headers ---- */
-  for (;;) {
-    const marker = readMarker();
-    if (marker === 0xd8) continue; // SOI
-    if (marker === 0xd9) break;    // EOI
-    if (marker === 0x01 || (marker >= 0xd0 && marker <= 0xd7)) continue; // standalone
-
-    const seg = readSegment();
-    switch (marker) {
-      case 0xdb: { // DQT
-        let off = 0;
-        while (off < seg.length) {
-          const id = seg[off] & 0x0f;
-          const prec = seg[off] >> 4;
-          off++;
-          const table = new Uint16Array(64);
-          for (let i = 0; i < 64; i++) {
-            table[ZIGZAG[i]] = prec ? seg.readUInt16BE(off + i * 2) : seg[off + i];
-          }
-          off += prec ? 128 : 64;
-          quantTables[id] = table;
-        }
-        break;
-      }
-      case 0xc4: { // DHT
-        let off = 0;
-        while (off < seg.length) {
-          const tc = seg[off] >> 4;
-          const th = seg[off] & 0x0f;
-          off++;
-          const counts = Array.from(seg.slice(off, off + 16));
-          off += 16;
-          const total = counts.reduce((a, b) => a + b, 0);
-          const symbols = Array.from(seg.slice(off, off + total));
-          off += total;
-          const table = buildHuffmanTable(counts, symbols);
-          if (tc === 0) huffmanDC[th] = table;
-          else huffmanAC[th] = table;
-        }
-        break;
-      }
-      case 0xc0: // SOF0 (baseline)
-      case 0xc1: { // SOF1
-        precision = seg[0];
-        height = seg.readUInt16BE(1);
-        width = seg.readUInt16BE(3);
-        const ncomp = seg[5];
-        components = [];
-        for (let i = 0; i < ncomp; i++) {
-          const id = seg[6 + i * 3];
-          const hv = seg[7 + i * 3];
-          const tq = seg[8 + i * 3];
-          components.push({
-            id,
-            h: hv >> 4,
-            v: hv & 0x0f,
-            tq,
-            dcTable: null,
-            acTable: null,
-          });
-          if (hv >> 4 > maxH) maxH = hv >> 4;
-          if ((hv & 0x0f) > maxV) maxV = hv & 0x0f;
-        }
-        break;
-      }
-      case 0xc2:
-        throw new Error('JPEG progresivo no soportado');
-      case 0xda: { // SOS
-        const ns = seg[0];
-        for (let i = 0; i < ns; i++) {
-          const cs = seg[1 + i * 2];
-          const tdta = seg[2 + i * 2];
-          const comp = components.find(c => c.id === cs);
-          if (comp) {
-            comp.dcTable = huffmanDC[tdta >> 4];
-            comp.acTable = huffmanAC[tdta & 0x0f];
-          }
-        }
-        /* scan data starts here */
-        const scanData = buffer.slice(pos);
-        return decodeScan(scanData, components, width, height, maxH, maxV, quantTables);
-      }
-      default:
-        /* skip unknown segments */
-        break;
-    }
-  }
-  throw new Error('JPEG: no SOS found');
-}
-
-function decodeScan(data, components, width, height, maxH, maxV, quantTables) {
-  const reader = bitReader(data);
-  const mcusX = Math.ceil(width / (maxH * 8));
-  const mcusY = Math.ceil(height / (maxV * 8));
-
-  /* per-component planes */
-  const planes = components.map(comp => {
-    const pw = Math.ceil((width * comp.h) / maxH);
-    const ph = Math.ceil((height * comp.v) / maxV);
-    return {
-      comp,
-      data: new Float32Array(pw * ph),
-      width: pw,
-      height: ph,
-      dcPred: 0,
-    };
+  // Planos por componente (a resolución del componente)
+  const planes = comps.map((c) => {
+    const pw = mcusX * c.h * 8;
+    const ph = mcusY * c.v * 8;
+    return { w: pw, h: ph, data: new Float64Array(pw * ph) };
   });
+
+  const reader = bitReader(scan);
+  const predDC = new Array(comps.length).fill(0);
+
+  const compById = {};
+  comps.forEach((c, i) => (compById[c.id] = i));
 
   for (let my = 0; my < mcusY; my++) {
     for (let mx = 0; mx < mcusX; mx++) {
-      for (const plane of planes) {
-        const { comp } = plane;
+      for (const sc of scomps) {
+        const ci = compById[sc.id];
+        const comp = comps[ci];
+        const plane = planes[ci];
+        const dcDec = huff.dc[sc.td];
+        const acDec = huff.ac[sc.ta];
+        const qt = qtables[comp.tq];
+
         for (let by = 0; by < comp.v; by++) {
           for (let bx = 0; bx < comp.h; bx++) {
-            const block = new Float32Array(64);
-            /* DC */
-            const dcSym = reader.decodeHuffman(comp.dcTable);
-            let dcDiff = 0;
-            if (dcSym > 0) {
-              dcDiff = reader.readBits(dcSym);
-              if (dcDiff < (1 << (dcSym - 1))) dcDiff -= (1 << dcSym) - 1;
-            }
-            plane.dcPred += dcDiff;
-            block[0] = plane.dcPred * quantTables[comp.tq][0];
-            /* AC */
+            // DC
+            const t = huffDecode(reader, dcDec);
+            const diff = t > 0 ? extend(reader.getBits(t), t) : 0;
+            predDC[ci] += diff;
+            // AC
+            const coeff = new Float64Array(64);
+            coeff[0] = predDC[ci] * qt[0];
             let k = 1;
             while (k < 64) {
-              const rs = reader.decodeHuffman(comp.acTable);
+              const rs = huffDecode(reader, acDec);
               const r = rs >> 4;
               const s = rs & 0x0f;
               if (s === 0) {
-                if (r === 15) { k += 16; continue; }
+                if (r === 15) { k += 16; continue; } // ZRL
                 break; // EOB
               }
               k += r;
               if (k >= 64) break;
-              let val = reader.readBits(s);
-              if (val < (1 << (s - 1))) val -= (1 << s) - 1;
-              block[ZIGZAG[k]] = val * quantTables[comp.tq][ZIGZAG[k]];
+              coeff[ZZ[k]] = extend(reader.getBits(s), s) * qt[ZZ[k]];
               k++;
             }
-            const pixels = idct8x8(block);
-            const px = mx * comp.h * 8 + bx * 8;
-            const py = my * comp.v * 8 + by * 8;
+            const block = idct8x8(coeff);
+            const ox = (mx * comp.h + bx) * 8;
+            const oy = (my * comp.v + by) * 8;
             for (let y = 0; y < 8; y++) {
               for (let x = 0; x < 8; x++) {
-                const dx = px + x;
-                const dy = py + y;
-                if (dx < plane.width && dy < plane.height) {
-                  plane.data[dy * plane.width + dx] = pixels[y * 8 + x];
-                }
+                plane.data[(oy + y) * plane.w + (ox + x)] = block[y * 8 + x] + 128;
               }
             }
           }
         }
       }
+      reader.align(); // posibles RST entre MCUs
     }
   }
 
-  /* convert to RGB */
-  const rgb = new Uint8Array(width * height * 3);
-  const [yPlane, cbPlane, crPlane] = planes;
+  // Recomponer a RGB con upsampling nearest.
+  // Nota: las imágenes de este proyecto son 4:4:4 (sin subsampling),
+  // pero el índice se calcula de forma general para 4:2:0/4:2:2.
+  const rgba = new Uint8Array(width * height * 4);
+  const ncomp = comps.length;
   for (let y = 0; y < height; y++) {
     for (let x = 0; x < width; x++) {
-      const yi = yPlane.data[y * yPlane.width + x];
-      const cbi = cbPlane.data[
-        Math.min(Math.floor(y * cbPlane.height / height), cbPlane.height - 1) * cbPlane.width +
-        Math.min(Math.floor(x * cbPlane.width / width), cbPlane.width - 1)
-      ];
-      const cri = crPlane.data[
-        Math.min(Math.floor(y * crPlane.height / height), crPlane.height - 1) * crPlane.width +
-        Math.min(Math.floor(x * crPlane.width / width), crPlane.width - 1)
-      ];
-      const idx = (y * width + x) * 3;
-      rgb[idx] = clamp(Math.round(yi + 1.402 * (cri - 128)), 0, 255);
-      rgb[idx + 1] = clamp(Math.round(yi - 0.344136 * (cbi - 128) - 0.714136 * (cri - 128)), 0, 255);
-      rgb[idx + 2] = clamp(Math.round(yi + 1.772 * (cbi - 128)), 0, 255);
+      const o = (y * width + x) * 4;
+      if (ncomp === 1) {
+        const sy = Math.min(planes[0].h - 1, Math.floor(y * planes[0].h / height));
+        const sx = Math.min(planes[0].w - 1, Math.floor(x * planes[0].w / width));
+        const g = planes[0].data[sy * planes[0].w + sx];
+        rgba[o] = rgba[o + 1] = rgba[o + 2] = clamp255(g);
+      } else {
+        const sy0 = Math.min(planes[0].h - 1, Math.floor(y * planes[0].h / height));
+        const sx0 = Math.min(planes[0].w - 1, Math.floor(x * planes[0].w / width));
+        const sy1 = Math.min(planes[1].h - 1, Math.floor(y * planes[1].h / height));
+        const sx1 = Math.min(planes[1].w - 1, Math.floor(x * planes[1].w / width));
+        const sy2 = Math.min(planes[2].h - 1, Math.floor(y * planes[2].h / height));
+        const sx2 = Math.min(planes[2].w - 1, Math.floor(x * planes[2].w / width));
+        const Y = planes[0].data[sy0 * planes[0].w + sx0];
+        const Cb = planes[1].data[sy1 * planes[1].w + sx1] - 128;
+        const Cr = planes[2].data[sy2 * planes[2].w + sx2] - 128;
+        rgba[o] = clamp255(Y + 1.402 * Cr);
+        rgba[o + 1] = clamp255(Y - 0.344136 * Cb - 0.714136 * Cr);
+        rgba[o + 2] = clamp255(Y + 1.772 * Cb);
+      }
+      rgba[o + 3] = 255;
     }
   }
-  return { data: rgb, width, height };
+  return { width, height, data: rgba };
 }
 
-function clamp(v, lo, hi) {
-  return v < lo ? lo : v > hi ? hi : v;
+function clamp255(v) {
+  return v < 0 ? 0 : v > 255 ? 255 : Math.round(v);
 }
 
-/* ------------------------------------------------------------------ */
-/*  Resizer (area-average / box sampling)                              */
-/* ------------------------------------------------------------------ */
+/* ============================================================
+   2. REESCALADO RGBA — muestreo de área (promedio de caja)
+   ============================================================ */
 
-function resize(src, srcW, srcH, dstW, dstH) {
-  const dst = new Uint8Array(dstW * dstH * 3);
-  const xRatio = srcW / dstW;
-  const yRatio = srcH / dstH;
-  for (let dy = 0; dy < dstH; dy++) {
-    for (let dx = 0; dx < dstW; dx++) {
-      const x0 = dx * xRatio;
-      const x1 = x0 + xRatio;
-      const y0 = dy * yRatio;
-      const y1 = y0 + yRatio;
-      let r = 0, g = 0, b = 0, area = 0;
-      const ix0 = Math.floor(x0);
-      const ix1 = Math.ceil(x1);
-      const iy0 = Math.floor(y0);
-      const iy1 = Math.ceil(y1);
-      for (let iy = iy0; iy < iy1; iy++) {
-        const wy = Math.min(iy + 1, y1) - Math.max(iy, y0);
-        if (wy <= 0) continue;
-        for (let ix = ix0; ix < ix1; ix++) {
-          const wx = Math.min(ix + 1, x1) - Math.max(ix, x0);
-          if (wx <= 0) continue;
-          const w = wx * wy;
-          const si = (Math.min(iy, srcH - 1) * srcW + Math.min(ix, srcW - 1)) * 3;
-          r += src[si] * w;
-          g += src[si + 1] * w;
-          b += src[si + 2] * w;
-          area += w;
+function resizeRGBA(img, newW, newH) {
+  const { width: sw, height: sh, data: src } = img;
+  const out = new Uint8Array(newW * newH * 4);
+  const xRatio = sw / newW;
+  const yRatio = sh / newH;
+  for (let y = 0; y < newH; y++) {
+    const y0 = Math.floor(y * yRatio);
+    const y1 = Math.max(y0 + 1, Math.ceil((y + 1) * yRatio));
+    for (let x = 0; x < newW; x++) {
+      const x0 = Math.floor(x * xRatio);
+      const x1 = Math.max(x0 + 1, Math.ceil((x + 1) * xRatio));
+      let r = 0, g = 0, b = 0, a = 0, n = 0;
+      for (let sy = y0; sy < y1; sy++) {
+        for (let sx = x0; sx < x1; sx++) {
+          const o = (sy * sw + sx) * 4;
+          r += src[o]; g += src[o + 1]; b += src[o + 2]; a += src[o + 3];
+          n++;
         }
       }
-      const di = (dy * dstW + dx) * 3;
-      dst[di] = Math.round(r / area);
-      dst[di + 1] = Math.round(g / area);
-      dst[di + 2] = Math.round(b / area);
+      const d = (y * newW + x) * 4;
+      out[d] = Math.round(r / n); out[d + 1] = Math.round(g / n); out[d + 2] = Math.round(b / n); out[d + 3] = Math.round(a / n);
     }
   }
-  return dst;
+  return { width: newW, height: newH, data: out };
 }
 
-/* ------------------------------------------------------------------ */
-/*  WebP lossless (VP8L) encoder                                       */
-/* ------------------------------------------------------------------ */
+/* ============================================================
+   3. CODIFICADOR WEBP LOSSLESS (VP8L)
+   ============================================================ */
 
-const LITERAL_CODES = 280;   // 256 literals + 24 length codes
-const DIST_CODES = 40;       // distance codes
-
-const LENGTH_BASE = [3,4,5,6,7,8,9,10,11,13,15,17,19,23,27,31,35,43,51,59,67,83,99,115,131];
-const LENGTH_EXTRA = [0,0,0,0,0,0,0,0,1,1,1,1,2,2,2,2,3,3,3,3,4,4,4,4,5];
-const DIST_BASE = [1,2,3,4,5,7,9,13,17,25,33,49,65,97,129,193,257,385,513,769,1025,1537,2049,3073,4097,6145,8193,12289,16385,24577,32769,49153,65537,98305,131073,163841,196609,229377,262145];
-const DIST_EXTRA = [0,0,0,0,1,1,2,2,3,3,4,4,5,5,6,6,7,7,8,8,9,9,10,10,11,11,12,12,13,13,14,14,15,15,16,16,17,17,18,18];
-
-function lengthToCode(len) {
-  for (let i = LENGTH_BASE.length - 1; i >= 0; i--) {
-    if (len >= LENGTH_BASE[i]) return i;
+class BitWriter {
+  constructor() {
+    this.bytes = [];
+    this.cur = 0;
+    this.nbits = 0;
   }
-  return 0;
-}
-
-function distToCode(dist) {
-  for (let i = DIST_BASE.length - 1; i >= 0; i--) {
-    if (dist >= DIST_BASE[i]) return i;
-  }
-  return 0;
-}
-
-/* LZ77 with hash chains */
-function lz77(data, width, height) {
-  const WINDOW = 1 << 15;
-  const MAX_CHAIN = 128;
-  const MIN_MATCH = 3;
-  const MAX_MATCH = 131;
-  const HASH_BITS = 15;
-  const HASH_SIZE = 1 << HASH_BITS;
-  const HASH_MASK = HASH_SIZE - 1;
-
-  const head = new Int32Array(HASH_SIZE).fill(-1);
-  const prev = new Int32Array(data.length).fill(-1);
-
-  function hash(pos) {
-    let h = data[pos] | (data[pos + 1] << 8) | (data[pos + 2] << 16);
-    h = ((h * 0x9e3779b1) >>> 0) & HASH_MASK;
-    return h;
-  }
-
-  const tokens = [];
-  let pos = 0;
-  const totalPixels = width * height;
-
-  while (pos < data.length) {
-    let bestLen = 0;
-    let bestDist = 0;
-
-    if (pos + MIN_MATCH <= data.length) {
-      const h = hash(pos);
-      let candidate = head[h];
-      let chain = 0;
-      const maxLen = Math.min(MAX_MATCH, data.length - pos);
-
-      while (candidate >= 0 && chain < MAX_CHAIN) {
-        const dist = pos - candidate;
-        if (dist > WINDOW) break;
-        let len = 0;
-        while (len < maxLen && data[candidate + len] === data[pos + len]) len++;
-        if (len > bestLen) {
-          bestLen = len;
-          bestDist = dist;
-          if (len >= maxLen) break;
-        }
-        candidate = prev[candidate];
-        chain++;
+  writeBits(value, n) {
+    for (let i = 0; i < n; i++) {
+      this.cur |= ((value >> i) & 1) << this.nbits;
+      this.nbits++;
+      if (this.nbits === 8) {
+        this.bytes.push(this.cur);
+        this.cur = 0;
+        this.nbits = 0;
       }
     }
-
-    if (bestLen >= MIN_MATCH) {
-      tokens.push({ type: 'match', len: bestLen, dist: bestDist });
-      for (let i = 0; i < bestLen; i++) {
-        if (pos + i + MIN_MATCH <= data.length) {
-          const h = hash(pos + i);
-          prev[pos + i] = head[h];
-          head[h] = pos + i;
-        }
-      }
-      pos += bestLen;
-    } else {
-      tokens.push({ type: 'literal', sym: data[pos] });
-      if (pos + MIN_MATCH <= data.length) {
-        const h = hash(pos);
-        prev[pos] = head[h];
-        head[h] = pos;
-      }
-      pos++;
+  }
+  // Escribe el código Huffman canónico (bits en orden MSB→LSB del código)
+  writeHuff(code, len) {
+    for (let i = len - 1; i >= 0; i--) {
+      this.writeBits((code >> i) & 1, 1);
     }
   }
-  return tokens;
+  finish() {
+    if (this.nbits > 0) this.bytes.push(this.cur);
+    return Buffer.from(this.bytes);
+  }
 }
 
-/* canonical Huffman codes */
-function buildCanonicalCodes(lengths) {
-  const maxLen = Math.max(...lengths.filter(l => l > 0), 0);
+// Longitudes de código limitadas a 15 bits (package-merge no necesario
+// para alfabetos pequeños; usamos Huffman estándar con límite simple)
+function huffmanCodeLengths(freqs, maxBits) {
+  const n = freqs.length;
+  const lengths = new Array(n).fill(0);
+  const items = [];
+  for (let i = 0; i < n; i++) if (freqs[i] > 0) items.push({ sym: i, f: freqs[i] });
+  if (items.length === 0) return lengths;
+  if (items.length === 1) { lengths[items[0].sym] = 1; return lengths; }
+
+  // Huffman con límite de profundidad: heap simple
+  const depths = new Array(n).fill(0);
+  const nodes = items.map((it) => ({ f: it.f, left: -1, right: -1, sym: it.sym }));
+  // Construcción del árbol con cola de prioridad simple
+  const pq = nodes.map((nd, i) => i);
+  const pull = () => {
+    let bi = 0;
+    for (let i = 1; i < pq.length; i++) if (nodes[pq[i]].f < nodes[pq[bi]].f) bi = i;
+    return pq.splice(bi, 1)[0];
+  };
+  while (pq.length > 1) {
+    const a = pull();
+    const b = pull();
+    nodes.push({ f: nodes[a].f + nodes[b].f, left: a, right: b, sym: -1 });
+    pq.push(nodes.length - 1);
+  }
+  const walk = (ni, d) => {
+    const nd = nodes[ni];
+    if (nd.sym >= 0) { depths[nd.sym] = Math.max(1, d); return; }
+    walk(nd.left, d + 1);
+    walk(nd.right, d + 1);
+  };
+  walk(pq[0], 0);
+
+  // Limitar a maxBits (raro con nuestros alfabetos, pero por seguridad)
+  for (let i = 0; i < n; i++) {
+    if (depths[i] > 0) lengths[i] = Math.min(depths[i], maxBits);
+  }
+  return lengths;
+}
+
+// Asigna códigos canónicos a partir de longitudes
+function canonicalCodes(lengths) {
+  const maxLen = Math.max(...lengths, 0);
   const blCount = new Array(maxLen + 1).fill(0);
   for (const l of lengths) if (l > 0) blCount[l]++;
   const nextCode = new Array(maxLen + 1).fill(0);
@@ -479,277 +441,320 @@ function buildCanonicalCodes(lengths) {
     nextCode[bits] = code;
   }
   const codes = new Array(lengths.length).fill(0);
-  for (let n = 0; n < lengths.length; n++) {
-    if (lengths[n] > 0) {
-      codes[n] = nextCode[lengths[n]]++;
-    }
+  for (let i = 0; i < lengths.length; i++) {
+    if (lengths[i] > 0) codes[i] = nextCode[lengths[i]]++;
   }
   return codes;
 }
 
-/* bit writer (LSB-first) */
-function bitWriter() {
-  const bytes = [];
-  let bitBuf = 0;
-  let bitCnt = 0;
-  function writeBits(value, count) {
-    bitBuf |= value << bitCnt;
-    bitCnt += count;
-    while (bitCnt >= 8) {
-      bytes.push(bitBuf & 0xff);
-      bitBuf >>= 8;
-      bitCnt -= 8;
-    }
-  }
-  function finish() {
-    if (bitCnt > 0) {
-      bytes.push(bitBuf & 0xff);
-    }
-    return Buffer.from(bytes);
-  }
-  return { writeBits, finish };
-}
+// Escribe las longitudes de código de un Huffman. Si hay un único
+// símbolo usa la forma "simple" de VP8L; si no, envía las longitudes
+// literales codificadas con el Huffman del alfabeto de longitudes
+// (0..18), sin RLE, para mantenerlo sencillo y correcto.
+function writeHuffmanCode(w, lengths) {
+  const used = [];
+  for (let i = 0; i < lengths.length; i++) if (lengths[i] > 0) used.push(i);
 
-/* write Huffman code lengths (VP8L "simple" form for single-symbol alphabets) */
-function writeHuffmanCode(bw, lengths) {
-  const used = lengths.filter(l => l > 0);
-  if (used.length === 0) {
-    /* empty alphabet — write a single code of length 0 */
-    bw.writeBits(0, 1); // not simple
-    bw.writeBits(0, 4); // numCodeLengthCodes = 0 (invalid, but decoder won't read)
-    return;
-  }
   if (used.length === 1) {
-    /* simple form: 1 bit = 1, then symbol */
-    const sym = lengths.indexOf(used[0]);
-    bw.writeBits(1, 1); // simple
-    bw.writeBits(sym, 8); // symbol (8 bits for literal/length alphabet)
+    // Forma simple de VP8L: 1 bit a 1 + símbolo (1 u 8 bits) +
+    // 1 bit "is_last" a 1 (es el único código del alfabeto).
+    w.writeBits(1, 1);
+    const sym = used[0];
+    if (sym <= 1) {
+      w.writeBits(0, 1);
+      w.writeBits(sym, 1);
+    } else {
+      w.writeBits(1, 1);
+      w.writeBits(sym, 8);
+    }
+    w.writeBits(1, 1); // is_last
     return;
   }
-  /* normal form */
-  bw.writeBits(0, 1); // not simple
-  /* code length alphabet order */
+
+  w.writeBits(0, 1); // no simple
+  // Codificamos las longitudes con el código de longitudes (alfabeto 0..18),
+  // sin RLE (todo literal) para mantenerlo sencillo y correcto.
   const CODE_LENGTH_ORDER = [17, 18, 0, 1, 2, 3, 4, 5, 16, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15];
-  const NUM_CODE_LENGTH_CODES = 19;
-  /* build code length code lengths */
-  const clLengths = new Array(NUM_CODE_LENGTH_CODES).fill(0);
-  /* encode each code length as a literal (no RLE) */
-  const clSymbols = [];
-  for (const l of lengths) {
-    clSymbols.push(l); // 0..15
-  }
-  /* count frequencies */
-  const clFreq = new Array(NUM_CODE_LENGTH_CODES).fill(0);
-  for (const s of clSymbols) clFreq[s]++;
-  /* build Huffman for code lengths */
-  const clCodeLengths = buildHuffmanLengths(clFreq, 7);
-  /* write numCodeLengthCodes */
-  let numCodes = NUM_CODE_LENGTH_CODES;
-  while (numCodes > 4 && clCodeLengths[CODE_LENGTH_ORDER[numCodes - 1]] === 0) numCodes--;
-  bw.writeBits(numCodes - 4, 4);
+  const lenFreqs = new Array(19).fill(0);
+  for (const l of lengths) if (l > 0) lenFreqs[l]++;
+
+  const lenLengths = huffmanCodeLengths(lenFreqs, 7);
+  const lenCodes = canonicalCodes(lenLengths);
+
+  // Elegir cuántos códigos de longitud enviar (mínimo 4)
+  let numCodes = 19;
+  while (numCodes > 4 && lenLengths[CODE_LENGTH_ORDER[numCodes - 1]] === 0) numCodes--;
+
+  w.writeBits(numCodes - 4, 4);
   for (let i = 0; i < numCodes; i++) {
-    bw.writeBits(clCodeLengths[CODE_LENGTH_ORDER[i]], 3);
+    w.writeBits(lenLengths[CODE_LENGTH_ORDER[i]], 3);
   }
-  /* write code lengths */
-  const clCodes = buildCanonicalCodes(clCodeLengths);
-  for (const s of clSymbols) {
-    const len = clCodeLengths[s];
-    bw.writeBits(clCodes[s], len);
+
+  // Escribir cada longitud usando el código de longitudes
+  for (const l of lengths) {
+    w.writeHuff(lenCodes[l], lenLengths[l]);
   }
 }
 
-/* build Huffman code lengths from frequencies (package-merge simplified) */
-function buildHuffmanLengths(freqs, maxLen) {
-  const n = freqs.length;
-  const lengths = new Array(n).fill(0);
-  const items = [];
+const LITERAL_CODES = 256 + 24; // literales + códigos de longitud
+const DIST_CODES = 40;
+
+const kLengthBase = [1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24];
+const kLengthExtra = [0,0,0,0,0,0,0,0,1,1,1,1,2,2,2,2,3,3,3,3,4,4,4,4];
+const kDistBase = [1,2,3,4,5,7,9,13,17,25,33,49,65,97,129,193,257,385,513,769,1025,1537,2049,3073,4097,6145,8193,12289,16385,24577,32769,49153,65537,98305,131073,163841,196609,262145,393217,524289];
+const kDistExtra = [0,0,0,0,1,1,2,2,3,3,4,4,5,5,6,6,7,7,8,8,9,9,10,10,11,11,12,12,13,13,14,14,15,15,16,16,17,17,18,18];
+
+function lengthToCode(len) {
+  for (let i = 23; i >= 0; i--) if (len >= kLengthBase[i]) return 256 + i;
+  return 256;
+}
+function distToCode(dist) {
+  for (let i = 39; i >= 0; i--) if (dist >= kDistBase[i]) return i;
+  return 0;
+}
+
+// LZ77 con hash chains sobre píxeles ARGB (4 bytes)
+function lz77(argb) {
+  const n = argb.length;
+  const HASH_BITS = 15;
+  const HASH_SIZE = 1 << HASH_BITS;
+  const WINDOW = 4096;
+  const MAX_CHAIN = 64;
+  const MIN_MATCH = 3; // en píxeles
+  const MAX_MATCH = 24;
+
+  const head = new Int32Array(HASH_SIZE).fill(-1);
+  const prev = new Int32Array(n).fill(-1);
+
+  const hash = (i) => {
+    const p0 = argb[i];
+    const p1 = i + 1 < n ? argb[i + 1] : 0;
+    const p2 = i + 2 < n ? argb[i + 2] : 0;
+    return ((p0 * 0x1e35a7bd + p1 * 0x9e3779b1 + p2 * 0x85ebca6b) >>> 0) & (HASH_SIZE - 1);
+  };
+
+  const tokens = []; // {type:'lit',px} | {type:'copy',len,dist}
+  let i = 0;
+  while (i < n) {
+    let bestLen = 0;
+    let bestDist = 0;
+    if (i + MIN_MATCH <= n) {
+      const h = hash(i);
+      let cand = head[h];
+      let chain = 0;
+      while (cand >= 0 && i - cand <= WINDOW && chain < MAX_CHAIN) {
+        let len = 0;
+        const maxLen = Math.min(MAX_MATCH, n - i);
+        while (len < maxLen && argb[cand + len] === argb[i + len]) len++;
+        if (len > bestLen && len >= MIN_MATCH) {
+          bestLen = len;
+          bestDist = i - cand;
+          if (len >= maxLen) break;
+        }
+        cand = prev[cand];
+        chain++;
+      }
+    }
+    if (bestLen >= MIN_MATCH) {
+      tokens.push({ type: "copy", len: bestLen, dist: bestDist });
+      for (let k = 0; k < bestLen; k++) {
+        if (i + k + MIN_MATCH <= n) {
+          const h = hash(i + k);
+          prev[i + k] = head[h];
+          head[h] = i + k;
+        }
+      }
+      i += bestLen;
+    } else {
+      // Literal
+      const px = argb[i];
+      tokens.push({ type: "lit", px });
+      if (i + MIN_MATCH <= n) {
+        const h = hash(i);
+        prev[i] = head[h];
+        head[h] = i;
+      }
+      i++;
+    }
+  }
+  return tokens;
+}
+
+function encodeWebPLossless(img) {
+  const { width, height, data } = img;
+  const n = width * height;
+
+  // ARGB empaquetado (A<<24 | R<<16 | G<<8 | B)
+  const argb = new Uint32Array(n);
   for (let i = 0; i < n; i++) {
-    if (freqs[i] > 0) items.push({ sym: i, freq: freqs[i] });
-  }
-  if (items.length === 0) return lengths;
-  if (items.length === 1) {
-    lengths[items[0].sym] = 1;
-    return lengths;
-  }
-  /* simple Huffman: repeatedly merge two smallest */
-  const nodes = items.map(it => ({ ...it, children: null }));
-  const heap = [...nodes];
-  while (heap.length > 1) {
-    heap.sort((a, b) => a.freq - b.freq);
-    const a = heap.shift();
-    const b = heap.shift();
-    heap.push({ freq: a.freq + b.freq, children: [a, b] });
-  }
-  function walk(node, depth) {
-    if (node.children) {
-      walk(node.children[0], depth + 1);
-      walk(node.children[1], depth + 1);
-    } else {
-      lengths[node.sym] = Math.min(depth, maxLen);
-    }
-  }
-  walk(heap[0], 0);
-  return lengths;
-}
-
-/* encode image as WebP lossless */
-function encodeWebPLossless(rgb, width, height) {
-  /* convert RGB to ARGB (alpha=255) */
-  const argb = new Uint8Array(width * height * 4);
-  for (let i = 0; i < width * height; i++) {
-    argb[i * 4] = 255; // alpha
-    argb[i * 4 + 1] = rgb[i * 3]; // R
-    argb[i * 4 + 2] = rgb[i * 3 + 1]; // G
-    argb[i * 4 + 3] = rgb[i * 3 + 2]; // B
+    const o = i * 4;
+    argb[i] = ((data[o + 3] << 24) | (data[o] << 16) | (data[o + 1] << 8) | data[o + 2]) >>> 0;
   }
 
-  /* LZ77 on the green channel (VP8L uses green for literals) */
-  const green = new Uint8Array(width * height);
-  for (let i = 0; i < width * height; i++) green[i] = argb[i * 4 + 2];
-  const tokens = lz77(green, width, height);
+  const tokens = lz77(argb);
 
-  /* build frequency tables */
-  const greenFreq = new Array(LITERAL_CODES).fill(0);
-  const redFreq = new Array(256).fill(0);
-  const blueFreq = new Array(256).fill(0);
-  const alphaFreq = new Array(256).fill(0);
-  const distFreq = new Array(DIST_CODES).fill(0);
+  // Frecuencias de los 5 alfabetos: verde, rojo, azul, alfa, distancia
+  const fGreen = new Array(LITERAL_CODES).fill(0);
+  const fRed = new Array(256).fill(0);
+  const fBlue = new Array(256).fill(0);
+  const fAlpha = new Array(256).fill(0);
+  const fDist = new Array(DIST_CODES).fill(0);
 
   for (const t of tokens) {
-    if (t.type === 'literal') {
-      greenFreq[t.sym]++;
-      /* for simplicity, encode red/blue/alpha as literals too */
-      redFreq[argb[(tokens.indexOf(t)) * 4 + 1]]++;
-      blueFreq[argb[(tokens.indexOf(t)) * 4 + 3]]++;
-      alphaFreq[255]++;
+    if (t.type === "lit") {
+      const px = t.px;
+      fGreen[(px >> 8) & 0xff]++;
+      fRed[(px >> 16) & 0xff]++;
+      fBlue[px & 0xff]++;
+      fAlpha[(px >>> 24) & 0xff]++;
     } else {
-      const lenCode = lengthToCode(t.len);
-      greenFreq[256 + lenCode]++;
-      distFreq[distToCode(t.dist)]++;
+      fGreen[lengthToCode(t.len)]++; // código de longitud en alfabeto verde
+      fDist[distToCode(t.dist)]++;
     }
   }
+  // Asegurar al menos un símbolo por alfabeto (Huffman válido)
+  const ensure = (f) => { if (!f.some((x) => x > 0)) f[0] = 1; };
+  ensure(fGreen); ensure(fRed); ensure(fBlue); ensure(fAlpha); ensure(fDist);
 
-  /* build Huffman codes */
-  const greenLengths = buildHuffmanLengths(greenFreq, 15);
-  const redLengths = buildHuffmanLengths(redFreq, 15);
-  const blueLengths = buildHuffmanLengths(blueFreq, 15);
-  const alphaLengths = buildHuffmanLengths(alphaFreq, 15);
-  const distLengths = buildHuffmanLengths(distFreq, 15);
+  const lGreen = huffmanCodeLengths(fGreen, 15);
+  const lRed = huffmanCodeLengths(fRed, 15);
+  const lBlue = huffmanCodeLengths(fBlue, 15);
+  const lAlpha = huffmanCodeLengths(fAlpha, 15);
+  const lDist = huffmanCodeLengths(fDist, 15);
 
-  const greenCodes = buildCanonicalCodes(greenLengths);
-  const redCodes = buildCanonicalCodes(redLengths);
-  const blueCodes = buildCanonicalCodes(blueLengths);
-  const alphaCodes = buildCanonicalCodes(alphaLengths);
-  const distCodes = buildCanonicalCodes(distLengths);
+  // VP8L exige códigos canónicos completos (suma Kraft = 1). Con un
+  // único símbolo por alfabeto se usa la forma "simple"; con varios,
+  // el árbol Huffman ya es completo por construcción.
+  const cGreen = canonicalCodes(lGreen);
+  const cRed = canonicalCodes(lRed);
+  const cBlue = canonicalCodes(lBlue);
+  const cAlpha = canonicalCodes(lAlpha);
+  const cDist = canonicalCodes(lDist);
 
-  /* write bitstream */
-  const bw = bitWriter();
-  /* VP8L header */
-  bw.writeBits(0x2f, 8); // signature
-  bw.writeBits(width - 1, 14);
-  bw.writeBits(height - 1, 14);
-  bw.writeBits(0, 1); // alpha used
-  bw.writeBits(0, 3); // version
+  const w = new BitWriter();
+  w.writeBits(0x2f, 8); // firma VP8L
+  w.writeBits(width - 1, 14);
+  w.writeBits(height - 1, 14);
+  w.writeBits(0, 1); // alpha_is_used = 0 (opacas)
+  w.writeBits(0, 3); // version = 0
 
-  /* no transforms */
-  bw.writeBits(0, 1); // transform present
-  /* no color cache */
-  bw.writeBits(0, 1); // color cache present
-  /* no meta-Huffman */
-  bw.writeBits(0, 1); // meta-Huffman present
+  // Transformaciones: bit a 1 mientras haya; aquí ninguna
+  w.writeBits(0, 1);
 
-  /* write 5 Huffman codes */
-  writeHuffmanCode(bw, greenLengths);
-  writeHuffmanCode(bw, redLengths);
-  writeHuffmanCode(bw, blueLengths);
-  writeHuffmanCode(bw, alphaLengths);
-  writeHuffmanCode(bw, distLengths);
+  // color_cache_size = 0 → no cache
+  w.writeBits(0, 1);
 
-  /* encode tokens */
-  let pixelPos = 0;
+  // Meta-Huffman: huffman_image sin agrupación →
+  // "use meta huffman" bit = 0
+  w.writeBits(0, 1);
+
+  // 5 códigos Huffman (verde, rojo, azul, alfa, distancia)
+  writeHuffmanCode(w, lGreen);
+  writeHuffmanCode(w, lRed);
+  writeHuffmanCode(w, lBlue);
+  writeHuffmanCode(w, lAlpha);
+  writeHuffmanCode(w, lDist);
+
+  // Datos LZ77
   for (const t of tokens) {
-    if (t.type === 'literal') {
-      const sym = t.sym;
-      bw.writeBits(greenCodes[sym], greenLengths[sym]);
-      /* red, blue, alpha */
-      const r = argb[pixelPos * 4 + 1];
-      const b = argb[pixelPos * 4 + 3];
-      const a = argb[pixelPos * 4];
-      bw.writeBits(redCodes[r], redLengths[r]);
-      bw.writeBits(blueCodes[b], blueLengths[b]);
-      bw.writeBits(alphaCodes[a], alphaLengths[a]);
-      pixelPos++;
+    if (t.type === "lit") {
+      const px = t.px;
+      const g = (px >> 8) & 0xff;
+      w.writeHuff(cGreen[g], lGreen[g]);
+      w.writeHuff(cRed[(px >> 16) & 0xff], lRed[(px >> 16) & 0xff]);
+      w.writeHuff(cBlue[px & 0xff], lBlue[px & 0xff]);
+      w.writeHuff(cAlpha[(px >>> 24) & 0xff], lAlpha[(px >>> 24) & 0xff]);
     } else {
       const lenCode = lengthToCode(t.len);
-      bw.writeBits(greenCodes[256 + lenCode], greenLengths[256 + lenCode]);
-      bw.writeBits(t.len - LENGTH_BASE[lenCode], LENGTH_EXTRA[lenCode]);
+      w.writeHuff(cGreen[lenCode], lGreen[lenCode]);
+      const li = lenCode - 256;
+      if (kLengthExtra[li] > 0) {
+        w.writeBits(t.len - kLengthBase[li], kLengthExtra[li]);
+      }
       const dCode = distToCode(t.dist);
-      bw.writeBits(distCodes[dCode], distLengths[dCode]);
-      bw.writeBits(t.dist - DIST_BASE[dCode], DIST_EXTRA[dCode]);
-      pixelPos += t.len;
+      w.writeHuff(cDist[dCode], lDist[dCode]);
+      if (kDistExtra[dCode] > 0) {
+        w.writeBits(t.dist - kDistBase[dCode], kDistExtra[dCode]);
+      }
     }
   }
 
-  const payload = bw.finish();
+  const payload = w.finish();
 
-  /* RIFF container */
-  const riffSize = 12 + 8 + payload.length + (payload.length % 2);
-  const riff = Buffer.alloc(riffSize);
-  riff.write('RIFF', 0);
-  riff.writeUInt32LE(riffSize - 8, 4);
-  riff.write('WEBP', 8);
-  riff.write('VP8L', 12);
-  riff.writeUInt32LE(payload.length, 16);
-  payload.copy(riff, 20);
-  return riff;
+  // Contenedor RIFF WebP (los chunks van alineados a tamaño par)
+  const pad = payload.length % 2 === 1 ? Buffer.from([0]) : Buffer.alloc(0);
+  const vp8lChunk = Buffer.concat([Buffer.from("VP8L"), u32le(payload.length), payload, pad]);
+  return Buffer.concat([
+    Buffer.from("RIFF"),
+    u32le(4 + vp8lChunk.length),
+    Buffer.from("WEBP"),
+    vp8lChunk,
+  ]);
 }
 
-/* ------------------------------------------------------------------ */
-/*  Main                                                               */
-/* ------------------------------------------------------------------ */
+function u32le(v) {
+  const b = Buffer.alloc(4);
+  b.writeUInt32LE(v);
+  return b;
+}
 
-const ASSETS = path.join(__dirname, '..', '..', 'assets');
-const SIZES = [
-  { suffix: '400w', width: 400, height: 250 },
-  { suffix: '800w', width: 800, height: 500 },
+/* ============================================================
+   4. PROCESO
+   ============================================================ */
+
+const KB = 1024;
+
+const TRABAJOS = [
+  // Proyectos: original 800×500 → 400×250 (móvil) y 800×500 (escritorio)
+  { src: "assets/project-01.jpg", salidas: [[400, 250], [800, 500]] },
+  { src: "assets/project-02.jpg", salidas: [[400, 250], [800, 500]] },
+  { src: "assets/project-03.jpg", salidas: [[400, 250], [800, 500]] },
+  { src: "assets/project-04.jpg", salidas: [[400, 250], [800, 500]] },
 ];
 
-function main() {
-  const files = fs.readdirSync(ASSETS)
-    .filter(f => /^project-\d+\.jpg$/.test(f))
-    .sort();
+console.log("\n=== Optimización de imágenes (JPG → WebP + responsive) ===\n");
 
-  if (files.length === 0) {
-    console.error('No se encontraron imágenes project-*.jpg en', ASSETS);
-    process.exit(1);
+let totalAntes = 0;
+let totalDespues = 0;
+let errores = 0;
+
+for (const { src, salidas } of TRABAJOS) {
+  const abs = path.join(ROOT, src);
+  if (!fs.existsSync(abs)) {
+    console.log(`  ⚠️  No existe: ${src}`);
+    errores++;
+    continue;
   }
+  const sizeAntes = fs.statSync(abs).size;
+  totalAntes += sizeAntes;
 
-  let totalBefore = 0;
-  let totalAfter = 0;
-
-  for (const file of files) {
-    const srcPath = path.join(ASSETS, file);
-    const srcBuf = fs.readFileSync(srcPath);
-    totalBefore += srcBuf.length;
-
-    const { data: rgb, width, height } = decodeJpeg(srcBuf);
-    console.log(`Decodificado ${file}: ${width}×${height}`);
-
-    for (const size of SIZES) {
-      const resized = resize(rgb, width, height, size.width, size.height);
-      const webp = encodeWebPLossless(resized, size.width, size.height);
-      const outName = file.replace('.jpg', `-${size.suffix}.webp`);
-      const outPath = path.join(ASSETS, outName);
-      fs.writeFileSync(outPath, webp);
-      totalAfter += webp.length;
-      console.log(`  → ${outName}  ${(webp.length / 1024).toFixed(1)} KiB`);
-    }
+  let img;
+  try {
+    img = decodeJPEG(fs.readFileSync(abs));
+  } catch (e) {
+    console.log(`  ❌ ${src}: error decodificando JPEG — ${e.message}`);
+    errores++;
+    continue;
   }
+  console.log(`  ${src} — ${(sizeAntes / KB).toFixed(1)} KB (${img.width}×${img.height})`);
 
-  console.log('\nResumen:');
-  console.log(`  Antes:  ${(totalBefore / 1024).toFixed(1)} KiB (${files.length} archivos)`);
-  console.log(`  Después: ${(totalAfter / 1024).toFixed(1)} KiB (${files.length * SIZES.length} archivos)`);
-  console.log(`  Ahorro:  ${((1 - totalAfter / totalBefore) * 100).toFixed(1)} %`);
+  const base = src.replace(/\.jpe?g$/i, "");
+  for (const [w, h] of salidas) {
+    const escalada = (w === img.width && h === img.height) ? img : resizeRGBA(img, w, h);
+    const webp = encodeWebPLossless(escalada);
+    const dest = path.join(ROOT, `${base}-${w}w.webp`);
+    fs.writeFileSync(dest, webp);
+    totalDespues += webp.length;
+    console.log(
+      `    → ${base}-${w}w.webp — ${(webp.length / KB).toFixed(1)} KB (${w}×${h})`
+    );
+  }
 }
 
-main();
+console.log(`\n  Total original (JPG): ${(totalAntes / KB).toFixed(1)} KB`);
+console.log(`  Total generado (WebP, todos los tamaños): ${(totalDespues / KB).toFixed(1)} KB`);
+if (totalAntes > 0) {
+  console.log(`  Variación: ${(((totalDespues - totalAntes) / totalAntes) * 100).toFixed(1)} %`);
+}
+console.log(`\n=== Fin (${errores === 0 ? "todo OK" : errores + " errores"}) ===\n`);
+process.exit(errores === 0 ? 0 : 1);
