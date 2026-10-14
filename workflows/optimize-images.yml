@@ -16,6 +16,15 @@ jobs:
         with:
           node-version: '20'
 
+      - name: Download source JPGs from origin repo (public)
+        run: |
+          mkdir -p assets
+          BASE="https://raw.githubusercontent.com/bposti/portfolio-lab/main/assets"
+          for f in project-01 project-02 project-03 project-04; do
+            curl -fsSL "$BASE/$f.jpg" -o "assets/$f.jpg"
+            echo "Downloaded $f.jpg: $(stat -c%s assets/$f.jpg) bytes"
+          done
+
       - name: Run image optimizer
         run: node js/tests/optimize-images.cjs
 
